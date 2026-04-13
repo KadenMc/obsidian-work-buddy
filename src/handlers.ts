@@ -1,0 +1,960 @@
+import { App, Modal, Notice, Setting, getAllTags, MarkdownView, TFile } from "obsidian";
+import type { WorkBuddySettings } from "./settings";
+import type { HandlerResult, RouteParams } from "./server";
+
+// Convenience type alias for handler args
+type HArgs = [App, WorkBuddySettings, unknown, RouteParams, URLSearchParams];
+
+/**
+ * GET /health
+ * Returns plugin version and vault name.
+ */
+export async function healthHandler(...[app]: HArgs): Promise<HandlerResult> {
+	return {
+		status: 200,
+		body: {
+			status: "ok",
+			plugin: "obsidian-work-buddy",
+			version: "0.1.0",
+			vault: app.vault.getName(),
+		},
+	};
+}
+
+/**
+ * GET /tags
+ * Returns all vault-wide tags with occurrence counts.
+ */
+export async function tagsHandler(...[app]: HArgs): Promise<HandlerResult> {
+	const tagCounts: Record<string, number> = {};
+
+	for (const file of app.vault.getMarkdownFiles()) {
+		const cache = app.metadataCache.getFileCache(file);
+		if (!cache) continue;
+
+		const fileTags = getAllTags(cache);
+		if (!fileTags) continue;
+
+		for (const tag of fileTags) {
+			const normalized = tag.toLowerCase();
+			tagCounts[normalized] = (tagCounts[normalized] || 0) + 1;
+		}
+	}
+
+	return { status: 200, body: { tags: tagCounts } };
+}
+
+/**
+ * GET /tags/:tag
+ * Returns files containing a specific tag.
+ * The :tag param should include the # prefix (url-encoded as %23).
+ */
+export async function tagFilesHandler(
+	...[app, , , params]: HArgs
+): Promise<HandlerResult> {
+	let targetTag = params.tag || "";
+	if (!targetTag.startsWith("#")) {
+		targetTag = "#" + targetTag;
+	}
+	targetTag = targetTag.toLowerCase();
+
+	const files: string[] = [];
+
+	for (const file of app.vault.getMarkdownFiles()) {
+		const cache = app.metadataCache.getFileCache(file);
+		if (!cache) continue;
+
+		const fileTags = getAllTags(cache);
+		if (!fileTags) continue;
+
+		if (fileTags.some((t) => t.toLowerCase() === targetTag)) {
+			files.push(file.path);
+		}
+	}
+
+	return { status: 200, body: { tag: targetTag, files } };
+}
+
+/**
+ * GET /files/:path
+ * Read file content. Path is vault-relative.
+ */
+export async function filesReadHandler(
+	...[app, , , params]: HArgs
+): Promise<HandlerResult> {
+	const filePath = params.path || "";
+	const file = app.vault.getAbstractFileByPath(filePath);
+
+	if (!file || !(file instanceof TFile)) {
+		return { status: 404, body: { error: `File not found: ${filePath}` } };
+	}
+
+	const content = await app.vault.read(file);
+	return {
+		status: 200,
+		body: { path: filePath, content },
+	};
+}
+
+/**
+ * PUT /files/:path
+ * Write or create file content. Path is vault-relative.
+ * Body: { "content": "file content here" }
+ */
+export async function filesWriteHandler(
+	...[app, , body, params]: HArgs
+): Promise<HandlerResult> {
+	const filePath = params.path || "";
+	const content =
+		body && typeof body === "object" && "content" in body
+			? String((body as { content: unknown }).content)
+			: null;
+
+	if (content === null) {
+		return {
+			status: 400,
+			body: { error: 'Request body must include "content" field' },
+		};
+	}
+
+	const existing = app.vault.getAbstractFileByPath(filePath);
+
+	if (existing && existing instanceof TFile) {
+		await app.vault.modify(existing, content);
+		return { status: 200, body: { path: filePath, created: false } };
+	} else {
+		await app.vault.create(filePath, content);
+		return { status: 201, body: { path: filePath, created: true } };
+	}
+}
+
+/**
+ * GET /metadata/:path
+ * Returns cached metadata for a file (frontmatter, tags, links, headings, etc.).
+ */
+export async function metadataHandler(
+	...[app, , , params]: HArgs
+): Promise<HandlerResult> {
+	const filePath = params.path || "";
+	const file = app.vault.getAbstractFileByPath(filePath);
+
+	if (!file || !(file instanceof TFile)) {
+		return { status: 404, body: { error: `File not found: ${filePath}` } };
+	}
+
+	const cache = app.metadataCache.getFileCache(file);
+	if (!cache) {
+		return {
+			status: 200,
+			body: { path: filePath, metadata: null, note: "No cached metadata yet" },
+		};
+	}
+
+	// Serialize the CachedMetadata — it's already a plain object with
+	// tags, frontmatter, links, headings, sections, embeds, etc.
+	// JSON.stringify handles it cleanly.
+	return {
+		status: 200,
+		body: {
+			path: filePath,
+			metadata: {
+				frontmatter: cache.frontmatter ?? null,
+				tags: cache.tags ?? null,
+				allTags: getAllTags(cache) ?? [],
+				headings: cache.headings ?? null,
+				links: cache.links ?? null,
+				embeds: cache.embeds ?? null,
+				sections: cache.sections ?? null,
+				listItems: cache.listItems ?? null,
+				frontmatterLinks: cache.frontmatterLinks ?? null,
+			},
+		},
+	};
+}
+
+/**
+ * GET /search?q=...
+ * Simple file name + content search.
+ */
+export async function searchHandler(
+	...[app, , , , query]: HArgs
+): Promise<HandlerResult> {
+	const q = query.get("q");
+	if (!q) {
+		return { status: 400, body: { error: "Missing query parameter: q" } };
+	}
+
+	const lowerQ = q.toLowerCase();
+	const results: Array<{ path: string; match: "name" | "content" }> = [];
+	const maxResults = 50;
+
+	for (const file of app.vault.getMarkdownFiles()) {
+		if (results.length >= maxResults) break;
+
+		// Match file name
+		if (file.path.toLowerCase().includes(lowerQ)) {
+			results.push({ path: file.path, match: "name" });
+			continue;
+		}
+
+		// Match content (read is async but we limit results)
+		try {
+			const content = await app.vault.cachedRead(file);
+			if (content.toLowerCase().includes(lowerQ)) {
+				results.push({ path: file.path, match: "content" });
+			}
+		} catch {
+			// Skip files that can't be read
+		}
+	}
+
+	return { status: 200, body: { query: q, results } };
+}
+
+/**
+ * POST /eval
+ * Execute arbitrary JavaScript with access to the Obsidian App object.
+ * Body: { "code": "return app.vault.getMarkdownFiles().length" }
+ *
+ * The code is wrapped in an async function that receives `app` as its argument.
+ * Return values are JSON-serialized. Promises are awaited.
+ */
+export async function evalHandler(
+	...[app, settings, body]: HArgs
+): Promise<HandlerResult> {
+	if (!settings.evalEnabled) {
+		return {
+			status: 403,
+			body: { error: "Eval endpoint is disabled in settings" },
+		};
+	}
+
+	const code =
+		body && typeof body === "object" && "code" in body
+			? String((body as { code: unknown }).code)
+			: null;
+
+	if (!code) {
+		return {
+			status: 400,
+			body: { error: 'Request body must include "code" field' },
+		};
+	}
+
+	try {
+		// Wrap in async function so `return` and `await` work naturally
+		const fn = new Function("app", `return (async () => { ${code} })()`);
+
+		// Race against timeout
+		const timeout = settings.evalTimeoutMs || 10000;
+		const result = await Promise.race([
+			fn(app),
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error(`Eval timed out after ${timeout}ms`)), timeout)
+			),
+		]);
+
+		return { status: 200, body: { result } };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return { status: 500, body: { error: message } };
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Notification / Request endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory store for notification responses.
+ * Keyed by notification_id. Written by the modal's button callbacks,
+ * read (and cleared) by the poll endpoint.
+ */
+const notificationResponses: Record<
+	string,
+	{ status: "responded" | "dismissed" | "gateway"; value: unknown; responded_at: string | null; responded_via?: string }
+> = {};
+
+/**
+ * In-memory store for open notification modals.
+ * Keyed by notification_id. Stored when a modal is opened,
+ * removed when the modal closes (via onClose) or is dismissed externally.
+ */
+const openModals: Record<string, NotificationRequestModal> = {};
+
+/**
+ * Risk level → color mapping for the consent modal.
+ */
+const RISK_COLORS: Record<string, string> = {
+	low: "var(--text-success)",
+	moderate: "var(--text-warning)",
+	high: "var(--text-error)",
+};
+
+/**
+ * Modal for displaying notification requests and collecting responses.
+ * Handles: boolean, choice, range, and freeform response types.
+ */
+class NotificationRequestModal extends Modal {
+	private notificationId: string;
+	private data: {
+		title: string;
+		body: string;
+		response_type: string;
+		choices?: Array<{ key: string; label: string; description?: string }>;
+		number_range?: { min: number; max: number; step?: number };
+		risk?: string;
+		operation?: string;
+		default_ttl?: number;
+		callback?: { capability: string; params: Record<string, unknown> };
+	};
+
+	constructor(
+		app: App,
+		notificationId: string,
+		data: NotificationRequestModal["data"],
+	) {
+		super(app);
+		this.notificationId = notificationId;
+		this.data = data;
+	}
+
+	onOpen() {
+		// Track this modal so it can be dismissed externally
+		openModals[this.notificationId] = this;
+
+		const { contentEl } = this;
+		const { title, body, response_type, choices, number_range, risk } = this.data;
+
+		// Title
+		const titleEl = contentEl.createEl("h2", { text: title });
+
+		// Risk badge (for consent requests)
+		if (risk) {
+			const badge = titleEl.createEl("span", {
+				text: ` ${risk.toUpperCase()}`,
+			});
+			badge.style.fontSize = "0.6em";
+			badge.style.padding = "2px 8px";
+			badge.style.borderRadius = "4px";
+			badge.style.marginLeft = "8px";
+			badge.style.color = RISK_COLORS[risk] || "var(--text-muted)";
+			badge.style.border = `1px solid ${RISK_COLORS[risk] || "var(--text-muted)"}`;
+		}
+
+		// Body
+		if (body) {
+			contentEl.createEl("p", { text: body });
+		}
+
+		// Response UI based on type
+		if (response_type === "choice" && choices?.length) {
+			this.renderChoices(contentEl, choices);
+		} else if (response_type === "boolean") {
+			this.renderBoolean(contentEl);
+		} else if (response_type === "range" && number_range) {
+			this.renderRange(contentEl, number_range);
+		} else if (response_type === "freeform") {
+			this.renderFreeform(contentEl);
+		} else if (response_type === "none") {
+			// Notification only — just an OK button
+			new Setting(contentEl).addButton((btn) =>
+				btn.setButtonText("OK").setCta().onClick(() => this.close())
+			);
+		}
+	}
+
+	onClose() {
+		// Unregister from the open modals tracker
+		delete openModals[this.notificationId];
+		this.contentEl.empty();
+	}
+
+	private respond(value: unknown) {
+		// Store in memory for active polling (handles "I'm right here" case)
+		notificationResponses[this.notificationId] = {
+			status: "responded",
+			value,
+			responded_at: new Date().toISOString(),
+		};
+
+		// Also dispatch via messaging service for deferred resolution.
+		// If the polling script already exited, this ensures the response
+		// is still acted on. The sidecar's MessagePoller picks up the
+		// message and dispatches the consent_grant capability.
+		if (this.data.operation && typeof value === "string" && value !== "deny") {
+			this.dispatchConsentGrant(this.data.operation, value as string);
+		}
+
+		this.close();
+	}
+
+	/**
+	 * POST a consent_grant message to the messaging service (localhost:5123).
+	 * The sidecar's MessagePoller dispatches it as a capability call.
+	 * Fire-and-forget — errors are logged but don't block the modal.
+	 */
+	private dispatchConsentGrant(operation: string, mode: string) {
+		const http = require("http");
+		const ttlMinutes = mode === "temporary" ? (this.data.default_ttl || 5) : undefined;
+
+		const body = JSON.stringify({
+			sender: "obsidian-consent-modal",
+			recipient: "work-buddy",
+			type: "result",
+			subject: "consent_grant",
+			body: JSON.stringify({
+				operation,
+				mode,
+				ttl_minutes: ttlMinutes,
+			}),
+			priority: "high",
+			tags: ["consent-callback", "from-obsidian"],
+		});
+
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port: 5123,
+				path: "/messages",
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(body),
+				},
+				timeout: 5000,
+			},
+			(res: { statusCode: number }) => {
+				console.log(
+					`[work-buddy] Consent grant dispatched: ${operation} (${mode}) → ${res.statusCode}`
+				);
+			}
+		);
+
+		req.on("error", (err: Error) => {
+			console.warn(
+				`[work-buddy] Failed to dispatch consent grant (messaging service may be offline): ${err.message}`
+			);
+		});
+
+		req.write(body);
+		req.end();
+	}
+
+	private renderChoices(
+		container: HTMLElement,
+		choices: Array<{ key: string; label: string; description?: string }>
+	) {
+		for (const choice of choices) {
+			const setting = new Setting(container);
+			setting.setName(choice.label);
+			if (choice.description) {
+				setting.setDesc(choice.description);
+			}
+			setting.addButton((btn) => {
+				btn.setButtonText(choice.label).onClick(() => this.respond(choice.key));
+				// Make the first choice the CTA (primary) button
+				if (choice === choices[0]) {
+					btn.setCta();
+				}
+			});
+		}
+	}
+
+	private renderBoolean(container: HTMLElement) {
+		new Setting(container)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Yes")
+					.setCta()
+					.onClick(() => this.respond(true))
+			)
+			.addButton((btn) =>
+				btn.setButtonText("No").onClick(() => this.respond(false))
+			);
+	}
+
+	private renderRange(
+		container: HTMLElement,
+		range: { min: number; max: number; step?: number }
+	) {
+		const step = range.step || 1;
+		let currentValue = Math.round((range.min + range.max) / 2);
+
+		const display = container.createEl("p", {
+			text: `Value: ${currentValue}`,
+		});
+		display.style.fontSize = "1.2em";
+		display.style.textAlign = "center";
+
+		const slider = container.createEl("input");
+		slider.type = "range";
+		slider.min = String(range.min);
+		slider.max = String(range.max);
+		slider.step = String(step);
+		slider.value = String(currentValue);
+		slider.style.width = "100%";
+		slider.addEventListener("input", () => {
+			currentValue = Number(slider.value);
+			display.textContent = `Value: ${currentValue}`;
+		});
+
+		new Setting(container).addButton((btn) =>
+			btn
+				.setButtonText("Submit")
+				.setCta()
+				.onClick(() => this.respond(currentValue))
+		);
+	}
+
+	private renderFreeform(container: HTMLElement) {
+		let text = "";
+		const textarea = container.createEl("textarea");
+		textarea.style.width = "100%";
+		textarea.style.minHeight = "100px";
+		textarea.style.marginBottom = "12px";
+		textarea.addEventListener("input", () => {
+			text = textarea.value;
+		});
+
+		new Setting(container).addButton((btn) =>
+			btn
+				.setButtonText("Submit")
+				.setCta()
+				.onClick(() => this.respond(text))
+		);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Custom modal types (triage views moved to dashboard — see dashboard/frontend.py)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /notifications/show
+ * Show a notification/request modal to the user.
+ * Fire-and-forget: returns immediately, user response is polled separately.
+ *
+ * Body: {
+ *   notification_id: string,
+ *   title: string,
+ *   body?: string,
+ *   response_type: "none" | "boolean" | "choice" | "freeform" | "range" | "custom",
+ *   choices?: [{key, label, description}],
+ *   number_range?: {min, max, step},
+ *   risk?: string,       // for consent: "low", "moderate", "high"
+ *   custom_template?: object  // custom types routed to dashboard instead
+ * }
+ */
+export async function notificationShowHandler(
+	...[app, , body]: HArgs
+): Promise<HandlerResult> {
+	if (!body || typeof body !== "object") {
+		return { status: 400, body: { error: "JSON body required" } };
+	}
+
+	const data = body as Record<string, unknown>;
+	const notificationId = data.notification_id as string;
+
+	if (!notificationId) {
+		return {
+			status: 400,
+			body: { error: "notification_id is required" },
+		};
+	}
+
+	const responseType = (data.response_type as string) || "none";
+	const isGateway = Boolean(data.gateway);
+
+	// Gateway mode MUST be checked before the "none" early-return below,
+	// because gateway applies to ALL non-consent notifications including NONE.
+	// Gateway mode: Obsidian acts as a lightweight notification surface.
+	// Two variants based on expandable flag:
+	//   - Non-expandable: simple dismiss toast (click to acknowledge)
+	//   - Expandable: toast with "Open in Dashboard" deep-link
+	// Consent requests bypass gateway entirely (handled by modal below).
+	if (isGateway) {
+		const title = (data.title as string) || "Notification";
+		const body = (data.body as string) || "";
+		const shortId = (data.short_id as string) || "";
+		const isExpandable = Boolean(data.expandable);
+
+		const fragment = document.createDocumentFragment();
+
+		const header = document.createElement("div");
+		header.style.cssText = "font-weight:600; margin-bottom:4px;";
+		header.textContent = shortId ? `[#${shortId}] ${title}` : title;
+		fragment.appendChild(header);
+
+		if (isExpandable) {
+			// --- Expandable: show body summary + "Open in Dashboard" button ---
+			if (body) {
+				const bodyEl = document.createElement("div");
+				bodyEl.style.cssText = "font-size:0.9em; opacity:0.85; margin-bottom:8px;";
+				bodyEl.textContent = body.length > 120 ? body.slice(0, 117) + "..." : body;
+				fragment.appendChild(bodyEl);
+			}
+
+			const btn = document.createElement("button");
+			btn.textContent = "Open in Dashboard";
+			btn.className = "mod-cta";
+			btn.style.cssText = "margin-top:8px; font-size:0.85em;";
+			fragment.appendChild(btn);
+
+			// Persistent until user dismisses or clicks through
+			const notice = new Notice(fragment, 0);
+			btn.addEventListener("click", () => {
+				// Route through the bridge (port 27125) — fetch() from Notice
+				// click handlers can reach the bridge (CORS *) but not other
+				// ports. The bridge relays to dashboard → Chrome extension.
+				fetch("http://127.0.0.1:27125/notifications/open-dashboard", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ view_id: notificationId }),
+				}).catch((err) => {
+					console.warn(`[work-buddy] Open dashboard failed: ${err}`);
+				});
+				notice.hide();
+			});
+		} else {
+			// --- Non-expandable: simple dismiss toast ---
+			// Shows title + short body with a Dismiss button.
+			if (body) {
+				const bodyEl = document.createElement("div");
+				bodyEl.style.cssText = "font-size:0.9em; opacity:0.85; margin-bottom:8px;";
+				bodyEl.textContent = body;
+				fragment.appendChild(bodyEl);
+			}
+
+			const dismissBtn = document.createElement("button");
+			dismissBtn.textContent = "Dismiss";
+			dismissBtn.className = "mod-muted";
+			dismissBtn.style.cssText = "margin-top:8px; padding:4px 16px; font-size:13px; cursor:pointer;";
+			fragment.appendChild(dismissBtn);
+
+			// All gateway notices are persistent — transient ones are too easy to miss
+			const notice = new Notice(fragment, 0);
+
+			// Dismiss button: acknowledge via the bridge's own /notifications/acknowledge
+			// endpoint (port 27125), which relays to the messaging service.
+			// Uses fetch() because require("http") doesn't work from Notice click
+			// handlers (esbuild bundling issue). The bridge has CORS * so fetch works.
+			dismissBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				console.log(`[work-buddy] Acknowledge clicked for ${notificationId}`);
+
+				fetch("http://127.0.0.1:27125/notifications/acknowledge", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ notification_id: notificationId }),
+				})
+					.then((res) => console.log(`[work-buddy] Acknowledge: ${res.status}`))
+					.catch((err) => console.warn(`[work-buddy] Acknowledge failed: ${err}`));
+
+				notice.hide();
+			});
+		}
+
+		// Track for external dismiss
+		notificationResponses[notificationId] = {
+			status: "gateway",
+			value: null,
+			responded_at: null,
+		};
+
+		return { status: 200, body: { shown: true, type: isExpandable ? "gateway-expandable" : "gateway-dismiss" } };
+	}
+
+	// Simple notification without gateway (direct bridge calls, legacy)
+	if (responseType === "none") {
+		const title = (data.title as string) || "Notification";
+		const msg = data.body ? `${title}: ${data.body}` : title;
+		new Notice(msg, data.priority === "urgent" ? 0 : 10000);
+
+		notificationResponses[notificationId] = {
+			status: "responded",
+			value: null,
+			responded_at: new Date().toISOString(),
+		};
+
+		return { status: 200, body: { shown: true, type: "notice" } };
+	}
+
+	// Custom types are handled by the dashboard, not Obsidian modals.
+	if (responseType === "custom") {
+		return {
+			status: 400,
+			body: { error: "Custom response types should use the dashboard transport, not Obsidian" },
+		};
+	}
+
+	// Standard request types — show a modal (consent requests reach here)
+	const modal = new NotificationRequestModal(app, notificationId, {
+		title: (data.title as string) || "Request",
+		body: (data.body as string) || "",
+		response_type: responseType,
+		choices: data.choices as NotificationRequestModal["data"]["choices"],
+		number_range: data.number_range as NotificationRequestModal["data"]["number_range"],
+		risk: data.risk as string,
+		operation: data.operation as string,
+		default_ttl: data.default_ttl as number,
+		callback: data.callback as NotificationRequestModal["data"]["callback"],
+	});
+	modal.open();
+
+	return { status: 200, body: { shown: true, type: "modal" } };
+}
+
+/**
+ * GET /notifications/status/:id
+ * Poll for a notification response.
+ * Returns {status: "pending"} if no response yet,
+ * or {status: "responded", value: ...} if the user has responded.
+ * The response is cleared after reading (one-shot).
+ */
+export async function notificationStatusHandler(
+	...[, , , params]: HArgs
+): Promise<HandlerResult> {
+	const id = params.id || "";
+	if (!id) {
+		return { status: 400, body: { error: "Notification ID required" } };
+	}
+
+	const response = notificationResponses[id];
+	if (!response) {
+		return { status: 200, body: { status: "pending" } };
+	}
+
+	// Clear after reading (one-shot)
+	delete notificationResponses[id];
+
+	return {
+		status: 200,
+		body: response,
+	};
+}
+
+/**
+ * POST /notifications/acknowledge
+ * Relay an acknowledge signal to the messaging service (port 5123).
+ * Used by gateway dismiss buttons that can't reach external services directly
+ * from Notice click handlers (esbuild bundling breaks require("http") in
+ * dynamically created DOM event listeners).
+ *
+ * Body: { notification_id: string }
+ */
+export async function notificationAcknowledgeHandler(
+	...[, , body]: HArgs
+): Promise<HandlerResult> {
+	if (!body || typeof body !== "object") {
+		return { status: 400, body: { error: "JSON body required" } };
+	}
+
+	const data = body as Record<string, unknown>;
+	const notificationId = data.notification_id as string;
+
+	if (!notificationId) {
+		return { status: 400, body: { error: "notification_id is required" } };
+	}
+
+	// Call the dashboard's acknowledge endpoint directly.
+	// The dashboard handles cross-transport dismiss (Telegram, etc.).
+	const http = require("http");
+	const payload = JSON.stringify({ responded_via: "obsidian" });
+
+	return new Promise<HandlerResult>((resolve) => {
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port: 5127,
+				path: `/api/notifications/${notificationId}/acknowledge`,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(payload),
+				},
+				timeout: 5000,
+			},
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(res: any) => {
+				let respData = "";
+				res.on("data", (chunk: string) => (respData += chunk));
+				res.on("end", () => {
+					console.log(
+						`[work-buddy] Acknowledge for ${notificationId} → ${res.statusCode}`
+					);
+					resolve({
+						status: 200,
+						body: { acknowledged: true, dashboard_status: res.statusCode },
+					});
+				});
+			}
+		);
+		req.on("error", (err: Error) => {
+			console.warn(`[work-buddy] Acknowledge failed: ${err.message}`);
+			resolve({
+				status: 502,
+				body: { error: `Dashboard unreachable: ${err.message}` },
+			});
+		});
+		req.write(payload);
+		req.end();
+	});
+}
+
+/**
+ * POST /notifications/open-dashboard
+ * Relay to the dashboard's /api/open-dashboard endpoint, which uses the
+ * Chrome extension to focus or create a dashboard tab with deep-link.
+ *
+ * Body: { view_id: string }
+ */
+export async function notificationOpenDashboardHandler(
+	...[, , body]: HArgs
+): Promise<HandlerResult> {
+	if (!body || typeof body !== "object") {
+		return { status: 400, body: { error: "JSON body required" } };
+	}
+
+	const data = body as Record<string, unknown>;
+	const viewId = (data.view_id as string) || "";
+
+	const http = require("http");
+	const payload = JSON.stringify({ view_id: viewId });
+
+	return new Promise<HandlerResult>((resolve) => {
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port: 5127,
+				path: "/api/open-dashboard",
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(payload),
+				},
+				timeout: 15000,
+			},
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(res: any) => {
+				let respData = "";
+				res.on("data", (chunk: string) => (respData += chunk));
+				res.on("end", () => {
+					console.log(
+						`[work-buddy] Open dashboard for ${viewId} → ${res.statusCode}`
+					);
+					resolve({
+						status: 200,
+						body: { relayed: true, dashboard_status: res.statusCode },
+					});
+				});
+			}
+		);
+		req.on("error", (err: Error) => {
+			console.warn(`[work-buddy] Open dashboard relay failed: ${err.message}`);
+			resolve({
+				status: 502,
+				body: { error: `Dashboard unreachable: ${err.message}` },
+			});
+		});
+		req.write(payload);
+		req.end();
+	});
+}
+
+/**
+ * POST /notifications/dismiss
+ * Dismiss a notification that was responded to on another transport.
+ * Closes the modal if it's still open and marks the notification as dismissed.
+ *
+ * Body: { notification_id: string, responded_via?: string }
+ *
+ * Returns { dismissed: true } on success (modal closed or already gone),
+ * or { dismissed: false } if the notification_id was never seen.
+ */
+export async function notificationDismissHandler(
+	...[, , body]: HArgs
+): Promise<HandlerResult> {
+	if (!body || typeof body !== "object") {
+		return { status: 400, body: { error: "JSON body required" } };
+	}
+
+	const data = body as Record<string, unknown>;
+	const notificationId = data.notification_id as string;
+
+	if (!notificationId) {
+		return {
+			status: 400,
+			body: { error: "notification_id is required" },
+		};
+	}
+
+	const respondedVia = (data.responded_via as string) || "unknown";
+
+	// Check if there's an open modal for this notification
+	const modal = openModals[notificationId];
+	if (modal) {
+		// Close the modal — onClose() will clean up openModals entry
+		modal.close();
+		console.log(`[work-buddy] Dismissed modal ${notificationId} (responded via ${respondedVia})`);
+
+		// If the user hasn't already responded via this modal, mark as dismissed
+		// so poll doesn't return "pending" forever
+		if (!notificationResponses[notificationId]) {
+			notificationResponses[notificationId] = {
+				status: "dismissed",
+				value: null,
+				responded_at: new Date().toISOString(),
+				responded_via: respondedVia,
+			};
+		}
+
+		return { status: 200, body: { dismissed: true } };
+	}
+
+	// No open modal — check if we at least know about this notification
+	if (notificationResponses[notificationId]) {
+		console.log(`[work-buddy] Dismiss no-op for ${notificationId} (already ${notificationResponses[notificationId].status})`);
+		return { status: 200, body: { dismissed: true } };
+	}
+
+	console.log(`[work-buddy] Dismiss miss: ${notificationId} not found`);
+	return { status: 200, body: { dismissed: false } };
+}
+
+/**
+ * GET /workspace
+ * Returns current workspace state: open files, active file, and leaf layout.
+ */
+export async function workspaceHandler(
+	...[app]: HArgs
+): Promise<HandlerResult> {
+	// Active file
+	const activeFile = app.workspace.getActiveFile();
+
+	// All open markdown leaves with their file paths
+	const openFiles: Array<{ path: string; active: boolean }> = [];
+	const seen = new Set<string>();
+
+	app.workspace.iterateAllLeaves((leaf) => {
+		if (leaf.view instanceof MarkdownView && leaf.view.file) {
+			const path = leaf.view.file.path;
+			if (!seen.has(path)) {
+				seen.add(path);
+				openFiles.push({
+					path,
+					active: activeFile?.path === path,
+				});
+			}
+		}
+	});
+
+	return {
+		status: 200,
+		body: {
+			active_file: activeFile?.path ?? null,
+			open_files: openFiles,
+			open_count: openFiles.length,
+		},
+	};
+}
