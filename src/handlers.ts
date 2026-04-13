@@ -5,18 +5,68 @@ import type { HandlerResult, RouteParams } from "./server";
 // Convenience type alias for handler args
 type HArgs = [App, WorkBuddySettings, unknown, RouteParams, URLSearchParams];
 
+/** Plugin version — keep in sync with manifest.json */
+const PLUGIN_VERSION = "0.1.0";
+
+/**
+ * Compatible work-buddy version range for this plugin release.
+ * When work-buddy sends wb_version and it's outside this range,
+ * we log a console warning so the user knows an update may be needed.
+ * This is a courtesy — the plugin doesn't enforce it.
+ */
+const WB_VERSION_MIN = "0.1.0";  // oldest work-buddy tested against
+const WB_VERSION_MAX = "0.2.0";  // first work-buddy version NOT tested
+
+/**
+ * Compare two semver strings. Returns -1 (a<b), 0 (equal), or 1 (a>b).
+ */
+function compareSemver(a: string, b: string): number {
+	const pa = a.split(".").map(Number);
+	const pb = b.split(".").map(Number);
+	for (let i = 0; i < 3; i++) {
+		if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+		if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+	}
+	return 0;
+}
+
 /**
  * GET /health
  * Returns plugin version and vault name.
+ * If the caller sends X-Work-Buddy-Version, checks compatibility and
+ * warns in the console if the plugin may be outdated.
  */
-export async function healthHandler(...[app]: HArgs): Promise<HandlerResult> {
+export async function healthHandler(...[app, , , , query]: HArgs): Promise<HandlerResult> {
+	// work-buddy sends its version as a query param: /health?wb_version=0.2.0
+	const callerVersion = query.get("wb_version");
+	let compatibility: "ok" | "outdated" = "ok";
+
+	if (callerVersion) {
+		if (compareSemver(callerVersion, WB_VERSION_MIN) < 0) {
+			compatibility = "outdated";
+			console.warn(
+				`[work-buddy] work-buddy v${callerVersion} may be too old for ` +
+				`plugin v${PLUGIN_VERSION} (tested with >= v${WB_VERSION_MIN}). ` +
+				`Update work-buddy.`
+			);
+		} else if (compareSemver(callerVersion, WB_VERSION_MAX) >= 0) {
+			compatibility = "outdated";
+			console.warn(
+				`[work-buddy] Plugin v${PLUGIN_VERSION} may be outdated — ` +
+				`work-buddy v${callerVersion} detected (tested up to v${WB_VERSION_MAX}). ` +
+				`Update the plugin in Settings → Community plugins.`
+			);
+		}
+	}
+
 	return {
 		status: 200,
 		body: {
 			status: "ok",
 			plugin: "obsidian-work-buddy",
-			version: "0.1.0",
+			version: PLUGIN_VERSION,
 			vault: app.vault.getName(),
+			compatibility,
 		},
 	};
 }
