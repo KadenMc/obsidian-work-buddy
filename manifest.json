@@ -1,7 +1,7 @@
 {
 	"id": "work-buddy",
 	"name": "Work Buddy",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "0.15.0",
 	"description": "HTTP bridge for the work-buddy agent framework — exposes the Obsidian API to external callers for vault queries, file I/O, notifications, and more.",
 	"author": "KadenMc",
