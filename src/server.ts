@@ -20,7 +20,7 @@ export type RouteHandler = (
 	body: unknown,
 	params: RouteParams,
 	query: URLSearchParams
-) => Promise<HandlerResult>;
+) => Promise<HandlerResult> | HandlerResult;
 
 interface Route {
 	method: string;
@@ -71,7 +71,7 @@ export class BridgeServer {
 	start(port: number, host: string): Promise<void> {
 		return new Promise((resolve, reject) => {
 			this.server = http.createServer((req, res) => {
-				this.handleRequest(req, res);
+				void this.handleRequest(req, res);
 			});
 
 			this.server.on("error", (err) => {
@@ -150,7 +150,7 @@ export class BridgeServer {
 	}
 
 	private logRequest(method: string, path: string, status: number, durationMs: number): void {
-		console.log(`[work-buddy] ${method} ${path} → ${status} (${durationMs}ms)`);
+		console.debug(`[work-buddy] ${method} ${path} → ${status} (${durationMs}ms)`);
 	}
 
 	private sendJson(res: http.ServerResponse, status: number, body: unknown): void {

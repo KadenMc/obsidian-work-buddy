@@ -1,3 +1,4 @@
+import http from "http";
 import { App, Modal, Notice, Setting, getAllTags, MarkdownView, TFile } from "obsidian";
 import type { WorkBuddySettings } from "./settings";
 import type { HandlerResult, RouteParams } from "./server";
@@ -6,7 +7,7 @@ import type { HandlerResult, RouteParams } from "./server";
 type HArgs = [App, WorkBuddySettings, unknown, RouteParams, URLSearchParams];
 
 /** Plugin version — keep in sync with manifest.json */
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.1.1";
 
 /**
  * Compatible work-buddy version range for this plugin release.
@@ -31,12 +32,92 @@ function compareSemver(a: string, b: string): number {
 }
 
 /**
+ * Send an HTTP request to a localhost service. Fire-and-forget pattern:
+ * resolves on response, logs errors but doesn't throw.
+ */
+function localPost(
+	port: number,
+	path: string,
+	payload: string,
+	label: string
+): Promise<number | null> {
+	return new Promise((resolve) => {
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port,
+				path,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(payload),
+				},
+				timeout: 5000,
+			},
+			(res: http.IncomingMessage) => {
+				// Drain the response body so the socket is freed
+				res.resume();
+				console.debug(`[work-buddy] ${label} → ${res.statusCode ?? "unknown"}`);
+				resolve(res.statusCode ?? null);
+			}
+		);
+		req.on("error", (err: Error) => {
+			console.warn(`[work-buddy] ${label} failed: ${err.message}`);
+			resolve(null);
+		});
+		req.write(payload);
+		req.end();
+	});
+}
+
+/**
+ * Send an HTTP request to a localhost service and collect the response body.
+ */
+function localPostWithBody(
+	port: number,
+	path: string,
+	payload: string,
+	label: string
+): Promise<{ statusCode: number | null; body: string }> {
+	return new Promise((resolve) => {
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port,
+				path,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"Content-Length": Buffer.byteLength(payload),
+				},
+				timeout: 15000,
+			},
+			(res: http.IncomingMessage) => {
+				let respData = "";
+				res.setEncoding("utf-8");
+				res.on("data", (chunk: string) => (respData += chunk));
+				res.on("end", () => {
+					console.debug(`[work-buddy] ${label} → ${res.statusCode ?? "unknown"}`);
+					resolve({ statusCode: res.statusCode ?? null, body: respData });
+				});
+			}
+		);
+		req.on("error", (err: Error) => {
+			console.warn(`[work-buddy] ${label} failed: ${err.message}`);
+			resolve({ statusCode: null, body: err.message });
+		});
+		req.write(payload);
+		req.end();
+	});
+}
+
+/**
  * GET /health
  * Returns plugin version and vault name.
  * If the caller sends X-Work-Buddy-Version, checks compatibility and
  * warns in the console if the plugin may be outdated.
  */
-export async function healthHandler(...[app, , , , query]: HArgs): Promise<HandlerResult> {
+export function healthHandler(...[app, , , , query]: HArgs): HandlerResult {
 	// work-buddy sends its version as a query param: /health?wb_version=0.2.0
 	const callerVersion = query.get("wb_version");
 	let compatibility: "ok" | "outdated" = "ok";
@@ -75,7 +156,7 @@ export async function healthHandler(...[app, , , , query]: HArgs): Promise<Handl
  * GET /tags
  * Returns all vault-wide tags with occurrence counts.
  */
-export async function tagsHandler(...[app]: HArgs): Promise<HandlerResult> {
+export function tagsHandler(...[app]: HArgs): HandlerResult {
 	const tagCounts: Record<string, number> = {};
 
 	for (const file of app.vault.getMarkdownFiles()) {
@@ -99,9 +180,9 @@ export async function tagsHandler(...[app]: HArgs): Promise<HandlerResult> {
  * Returns files containing a specific tag.
  * The :tag param should include the # prefix (url-encoded as %23).
  */
-export async function tagFilesHandler(
+export function tagFilesHandler(
 	...[app, , , params]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	let targetTag = params.tag || "";
 	if (!targetTag.startsWith("#")) {
 		targetTag = "#" + targetTag;
@@ -182,9 +263,9 @@ export async function filesWriteHandler(
  * GET /metadata/:path
  * Returns cached metadata for a file (frontmatter, tags, links, headings, etc.).
  */
-export async function metadataHandler(
+export function metadataHandler(
 	...[app, , , params]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	const filePath = params.path || "";
 	const file = app.vault.getAbstractFileByPath(filePath);
 
@@ -200,9 +281,6 @@ export async function metadataHandler(
 		};
 	}
 
-	// Serialize the CachedMetadata — it's already a plain object with
-	// tags, frontmatter, links, headings, sections, embeds, etc.
-	// JSON.stringify handles it cleanly.
 	return {
 		status: 200,
 		body: {
@@ -293,7 +371,9 @@ export async function evalHandler(
 
 	try {
 		// Wrap in async function so `return` and `await` work naturally
-		const fn = new Function("app", `return (async () => { ${code} })()`);
+		// The Function constructor is the eval endpoint's core mechanism — intentionally
+		// executes user-provided code, gated behind settings.evalEnabled.
+		const fn = new Function("app", `return (async () => { ${code} })()`) as (app: App) => Promise<unknown>;
 
 		// Race against timeout
 		const timeout = settings.evalTimeoutMs || 10000;
@@ -383,13 +463,12 @@ class NotificationRequestModal extends Modal {
 		if (risk) {
 			const badge = titleEl.createEl("span", {
 				text: ` ${risk.toUpperCase()}`,
+				cls: "wb-risk-badge",
 			});
-			badge.style.fontSize = "0.6em";
-			badge.style.padding = "2px 8px";
-			badge.style.borderRadius = "4px";
-			badge.style.marginLeft = "8px";
-			badge.style.color = RISK_COLORS[risk] || "var(--text-muted)";
-			badge.style.border = `1px solid ${RISK_COLORS[risk] || "var(--text-muted)"}`;
+			const color = RISK_COLORS[risk] || "var(--text-muted)";
+			badge.setCssProps({
+				"--wb-risk-color": color,
+			});
 		}
 
 		// Body
@@ -433,7 +512,7 @@ class NotificationRequestModal extends Modal {
 		// is still acted on. The sidecar's MessagePoller picks up the
 		// message and dispatches the consent_grant capability.
 		if (this.data.operation && typeof value === "string" && value !== "deny") {
-			this.dispatchConsentGrant(this.data.operation, value as string);
+			void this.dispatchConsentGrant(this.data.operation, value);
 		}
 
 		this.close();
@@ -444,11 +523,10 @@ class NotificationRequestModal extends Modal {
 	 * The sidecar's MessagePoller dispatches it as a capability call.
 	 * Fire-and-forget — errors are logged but don't block the modal.
 	 */
-	private dispatchConsentGrant(operation: string, mode: string) {
-		const http = require("http");
+	private async dispatchConsentGrant(operation: string, mode: string) {
 		const ttlMinutes = mode === "temporary" ? (this.data.default_ttl || 5) : undefined;
 
-		const body = JSON.stringify({
+		const payload = JSON.stringify({
 			sender: "obsidian-consent-modal",
 			recipient: "work-buddy",
 			type: "result",
@@ -462,33 +540,7 @@ class NotificationRequestModal extends Modal {
 			tags: ["consent-callback", "from-obsidian"],
 		});
 
-		const req = http.request(
-			{
-				hostname: "127.0.0.1",
-				port: 5123,
-				path: "/messages",
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Content-Length": Buffer.byteLength(body),
-				},
-				timeout: 5000,
-			},
-			(res: { statusCode: number }) => {
-				console.log(
-					`[work-buddy] Consent grant dispatched: ${operation} (${mode}) → ${res.statusCode}`
-				);
-			}
-		);
-
-		req.on("error", (err: Error) => {
-			console.warn(
-				`[work-buddy] Failed to dispatch consent grant (messaging service may be offline): ${err.message}`
-			);
-		});
-
-		req.write(body);
-		req.end();
+		await localPost(5123, "/messages", payload, `Consent grant: ${operation} (${mode})`);
 	}
 
 	private renderChoices(
@@ -533,9 +585,8 @@ class NotificationRequestModal extends Modal {
 
 		const display = container.createEl("p", {
 			text: `Value: ${currentValue}`,
+			cls: "wb-range-display",
 		});
-		display.style.fontSize = "1.2em";
-		display.style.textAlign = "center";
 
 		const slider = container.createEl("input");
 		slider.type = "range";
@@ -543,7 +594,7 @@ class NotificationRequestModal extends Modal {
 		slider.max = String(range.max);
 		slider.step = String(step);
 		slider.value = String(currentValue);
-		slider.style.width = "100%";
+		slider.addClass("wb-range-slider");
 		slider.addEventListener("input", () => {
 			currentValue = Number(slider.value);
 			display.textContent = `Value: ${currentValue}`;
@@ -560,9 +611,7 @@ class NotificationRequestModal extends Modal {
 	private renderFreeform(container: HTMLElement) {
 		let text = "";
 		const textarea = container.createEl("textarea");
-		textarea.style.width = "100%";
-		textarea.style.minHeight = "100px";
-		textarea.style.marginBottom = "12px";
+		textarea.addClass("wb-freeform-textarea");
 		textarea.addEventListener("input", () => {
 			text = textarea.value;
 		});
@@ -596,9 +645,9 @@ class NotificationRequestModal extends Modal {
  *   custom_template?: object  // custom types routed to dashboard instead
  * }
  */
-export async function notificationShowHandler(
+export function notificationShowHandler(
 	...[app, , body]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	if (!body || typeof body !== "object") {
 		return { status: 400, body: { error: "JSON body required" } };
 	}
@@ -621,34 +670,33 @@ export async function notificationShowHandler(
 	// Gateway mode: Obsidian acts as a lightweight notification surface.
 	// Two variants based on expandable flag:
 	//   - Non-expandable: simple dismiss toast (click to acknowledge)
-	//   - Expandable: toast with "Open in Dashboard" deep-link
+	//   - Expandable: toast with "Open in dashboard" deep-link
 	// Consent requests bypass gateway entirely (handled by modal below).
 	if (isGateway) {
 		const title = (data.title as string) || "Notification";
-		const body = (data.body as string) || "";
+		const bodyText = (data.body as string) || "";
 		const shortId = (data.short_id as string) || "";
 		const isExpandable = Boolean(data.expandable);
 
 		const fragment = document.createDocumentFragment();
 
 		const header = document.createElement("div");
-		header.style.cssText = "font-weight:600; margin-bottom:4px;";
+		header.addClass("wb-notice-header");
 		header.textContent = shortId ? `[#${shortId}] ${title}` : title;
 		fragment.appendChild(header);
 
 		if (isExpandable) {
-			// --- Expandable: show body summary + "Open in Dashboard" button ---
-			if (body) {
+			// --- Expandable: show body summary + "Open in dashboard" button ---
+			if (bodyText) {
 				const bodyEl = document.createElement("div");
-				bodyEl.style.cssText = "font-size:0.9em; opacity:0.85; margin-bottom:8px;";
-				bodyEl.textContent = body.length > 120 ? body.slice(0, 117) + "..." : body;
+				bodyEl.addClass("wb-notice-body");
+				bodyEl.textContent = bodyText.length > 120 ? bodyText.slice(0, 117) + "..." : bodyText;
 				fragment.appendChild(bodyEl);
 			}
 
 			const btn = document.createElement("button");
-			btn.textContent = "Open in Dashboard";
-			btn.className = "mod-cta";
-			btn.style.cssText = "margin-top:8px; font-size:0.85em;";
+			btn.textContent = "Open in dashboard";
+			btn.className = "mod-cta wb-notice-action";
 			fragment.appendChild(btn);
 
 			// Persistent until user dismisses or clicks through
@@ -661,25 +709,24 @@ export async function notificationShowHandler(
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ view_id: notificationId }),
-				}).catch((err) => {
-					console.warn(`[work-buddy] Open dashboard failed: ${err}`);
+				}).catch((err: unknown) => {
+					console.warn(`[work-buddy] Open dashboard failed: ${err instanceof Error ? err.message : String(err)}`);
 				});
 				notice.hide();
 			});
 		} else {
 			// --- Non-expandable: simple dismiss toast ---
 			// Shows title + short body with a Dismiss button.
-			if (body) {
+			if (bodyText) {
 				const bodyEl = document.createElement("div");
-				bodyEl.style.cssText = "font-size:0.9em; opacity:0.85; margin-bottom:8px;";
-				bodyEl.textContent = body;
+				bodyEl.addClass("wb-notice-body");
+				bodyEl.textContent = bodyText;
 				fragment.appendChild(bodyEl);
 			}
 
 			const dismissBtn = document.createElement("button");
 			dismissBtn.textContent = "Dismiss";
-			dismissBtn.className = "mod-muted";
-			dismissBtn.style.cssText = "margin-top:8px; padding:4px 16px; font-size:13px; cursor:pointer;";
+			dismissBtn.className = "mod-muted wb-notice-dismiss";
 			fragment.appendChild(dismissBtn);
 
 			// All gateway notices are persistent — transient ones are too easy to miss
@@ -691,15 +738,15 @@ export async function notificationShowHandler(
 			// handlers (esbuild bundling issue). The bridge has CORS * so fetch works.
 			dismissBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
-				console.log(`[work-buddy] Acknowledge clicked for ${notificationId}`);
+				console.debug(`[work-buddy] Acknowledge clicked for ${notificationId}`);
 
 				fetch("http://127.0.0.1:27125/notifications/acknowledge", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ notification_id: notificationId }),
 				})
-					.then((res) => console.log(`[work-buddy] Acknowledge: ${res.status}`))
-					.catch((err) => console.warn(`[work-buddy] Acknowledge failed: ${err}`));
+					.then((res) => console.debug(`[work-buddy] Acknowledge: ${res.status}`))
+					.catch((err: unknown) => console.warn(`[work-buddy] Acknowledge failed: ${err instanceof Error ? err.message : String(err)}`));
 
 				notice.hide();
 			});
@@ -718,7 +765,8 @@ export async function notificationShowHandler(
 	// Simple notification without gateway (direct bridge calls, legacy)
 	if (responseType === "none") {
 		const title = (data.title as string) || "Notification";
-		const msg = data.body ? `${title}: ${data.body}` : title;
+		const bodyStr = typeof data.body === "string" ? data.body : "";
+		const msg = bodyStr ? `${title}: ${bodyStr}` : title;
 		new Notice(msg, data.priority === "urgent" ? 0 : 10000);
 
 		notificationResponses[notificationId] = {
@@ -762,9 +810,9 @@ export async function notificationShowHandler(
  * or {status: "responded", value: ...} if the user has responded.
  * The response is cleared after reading (one-shot).
  */
-export async function notificationStatusHandler(
+export function notificationStatusHandler(
 	...[, , , params]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	const id = params.id || "";
 	if (!id) {
 		return { status: 400, body: { error: "Notification ID required" } };
@@ -786,7 +834,7 @@ export async function notificationStatusHandler(
 
 /**
  * POST /notifications/acknowledge
- * Relay an acknowledge signal to the messaging service (port 5123).
+ * Relay an acknowledge signal to the dashboard (port 5127).
  * Used by gateway dismiss buttons that can't reach external services directly
  * from Notice click handlers (esbuild bundling breaks require("http") in
  * dynamically created DOM event listeners).
@@ -807,49 +855,22 @@ export async function notificationAcknowledgeHandler(
 		return { status: 400, body: { error: "notification_id is required" } };
 	}
 
-	// Call the dashboard's acknowledge endpoint directly.
-	// The dashboard handles cross-transport dismiss (Telegram, etc.).
-	const http = require("http");
 	const payload = JSON.stringify({ responded_via: "obsidian" });
+	const result = await localPostWithBody(
+		5127,
+		`/api/notifications/${notificationId}/acknowledge`,
+		payload,
+		`Acknowledge ${notificationId}`
+	);
 
-	return new Promise<HandlerResult>((resolve) => {
-		const req = http.request(
-			{
-				hostname: "127.0.0.1",
-				port: 5127,
-				path: `/api/notifications/${notificationId}/acknowledge`,
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Content-Length": Buffer.byteLength(payload),
-				},
-				timeout: 5000,
-			},
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(res: any) => {
-				let respData = "";
-				res.on("data", (chunk: string) => (respData += chunk));
-				res.on("end", () => {
-					console.log(
-						`[work-buddy] Acknowledge for ${notificationId} → ${res.statusCode}`
-					);
-					resolve({
-						status: 200,
-						body: { acknowledged: true, dashboard_status: res.statusCode },
-					});
-				});
-			}
-		);
-		req.on("error", (err: Error) => {
-			console.warn(`[work-buddy] Acknowledge failed: ${err.message}`);
-			resolve({
-				status: 502,
-				body: { error: `Dashboard unreachable: ${err.message}` },
-			});
-		});
-		req.write(payload);
-		req.end();
-	});
+	if (result.statusCode === null) {
+		return { status: 502, body: { error: `Dashboard unreachable: ${result.body}` } };
+	}
+
+	return {
+		status: 200,
+		body: { acknowledged: true, dashboard_status: result.statusCode },
+	};
 }
 
 /**
@@ -869,47 +890,22 @@ export async function notificationOpenDashboardHandler(
 	const data = body as Record<string, unknown>;
 	const viewId = (data.view_id as string) || "";
 
-	const http = require("http");
 	const payload = JSON.stringify({ view_id: viewId });
+	const result = await localPostWithBody(
+		5127,
+		"/api/open-dashboard",
+		payload,
+		`Open dashboard for ${viewId}`
+	);
 
-	return new Promise<HandlerResult>((resolve) => {
-		const req = http.request(
-			{
-				hostname: "127.0.0.1",
-				port: 5127,
-				path: "/api/open-dashboard",
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Content-Length": Buffer.byteLength(payload),
-				},
-				timeout: 15000,
-			},
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(res: any) => {
-				let respData = "";
-				res.on("data", (chunk: string) => (respData += chunk));
-				res.on("end", () => {
-					console.log(
-						`[work-buddy] Open dashboard for ${viewId} → ${res.statusCode}`
-					);
-					resolve({
-						status: 200,
-						body: { relayed: true, dashboard_status: res.statusCode },
-					});
-				});
-			}
-		);
-		req.on("error", (err: Error) => {
-			console.warn(`[work-buddy] Open dashboard relay failed: ${err.message}`);
-			resolve({
-				status: 502,
-				body: { error: `Dashboard unreachable: ${err.message}` },
-			});
-		});
-		req.write(payload);
-		req.end();
-	});
+	if (result.statusCode === null) {
+		return { status: 502, body: { error: `Dashboard unreachable: ${result.body}` } };
+	}
+
+	return {
+		status: 200,
+		body: { relayed: true, dashboard_status: result.statusCode },
+	};
 }
 
 /**
@@ -922,9 +918,9 @@ export async function notificationOpenDashboardHandler(
  * Returns { dismissed: true } on success (modal closed or already gone),
  * or { dismissed: false } if the notification_id was never seen.
  */
-export async function notificationDismissHandler(
+export function notificationDismissHandler(
 	...[, , body]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	if (!body || typeof body !== "object") {
 		return { status: 400, body: { error: "JSON body required" } };
 	}
@@ -946,7 +942,7 @@ export async function notificationDismissHandler(
 	if (modal) {
 		// Close the modal — onClose() will clean up openModals entry
 		modal.close();
-		console.log(`[work-buddy] Dismissed modal ${notificationId} (responded via ${respondedVia})`);
+		console.debug(`[work-buddy] Dismissed modal ${notificationId} (responded via ${respondedVia})`);
 
 		// If the user hasn't already responded via this modal, mark as dismissed
 		// so poll doesn't return "pending" forever
@@ -964,11 +960,11 @@ export async function notificationDismissHandler(
 
 	// No open modal — check if we at least know about this notification
 	if (notificationResponses[notificationId]) {
-		console.log(`[work-buddy] Dismiss no-op for ${notificationId} (already ${notificationResponses[notificationId].status})`);
+		console.debug(`[work-buddy] Dismiss no-op for ${notificationId} (already ${notificationResponses[notificationId].status})`);
 		return { status: 200, body: { dismissed: true } };
 	}
 
-	console.log(`[work-buddy] Dismiss miss: ${notificationId} not found`);
+	console.debug(`[work-buddy] Dismiss miss: ${notificationId} not found`);
 	return { status: 200, body: { dismissed: false } };
 }
 
@@ -976,9 +972,9 @@ export async function notificationDismissHandler(
  * GET /workspace
  * Returns current workspace state: open files, active file, and leaf layout.
  */
-export async function workspaceHandler(
+export function workspaceHandler(
 	...[app]: HArgs
-): Promise<HandlerResult> {
+): HandlerResult {
 	// Active file
 	const activeFile = app.workspace.getActiveFile();
 

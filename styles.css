@@ -12,6 +12,65 @@
 }
 
 /* ============================================================
+   Work Buddy — Notification modals
+   ============================================================ */
+
+/* Risk badge on consent modal title */
+.wb-risk-badge {
+	font-size: 0.6em;
+	padding: 2px 8px;
+	border-radius: 4px;
+	margin-left: 8px;
+	color: var(--wb-risk-color, var(--text-muted));
+	border: 1px solid var(--wb-risk-color, var(--text-muted));
+}
+
+/* Range slider display value */
+.wb-range-display {
+	font-size: 1.2em;
+	text-align: center;
+}
+
+/* Range slider input */
+.wb-range-slider {
+	width: 100%;
+}
+
+/* Freeform textarea */
+.wb-freeform-textarea {
+	width: 100%;
+	min-height: 100px;
+	margin-bottom: 12px;
+}
+
+/* ============================================================
+   Work Buddy — Gateway notice toasts
+   ============================================================ */
+
+.wb-notice-header {
+	font-weight: 600;
+	margin-bottom: 4px;
+}
+
+.wb-notice-body {
+	font-size: 0.9em;
+	opacity: 0.85;
+	margin-bottom: 8px;
+}
+
+.wb-notice-action {
+	margin-top: 8px;
+	font-size: 0.85em;
+}
+
+.wb-notice-dismiss {
+	margin-top: 8px;
+	padding: 4px 16px;
+	font-size: 13px;
+	cursor: pointer;
+}
+
+/* ============================================================
    Work Buddy — Triage Modal Styles
    ============================================================ */
 
