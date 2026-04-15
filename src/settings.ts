@@ -27,7 +27,7 @@ export class WorkBuddySettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl("h2", { text: "Work Buddy Bridge" });
+		new Setting(containerEl).setName("Bridge configuration").setHeading();
 
 		new Setting(containerEl)
 			.setName("Port")
