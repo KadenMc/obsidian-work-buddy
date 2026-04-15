@@ -24,32 +24,32 @@ export default class WorkBuddyPlugin extends Plugin {
 	private bridge: BridgeServer | null = null;
 	private statusBarEl: HTMLElement | null = null;
 
-	async onload() {
-		await this.loadSettings();
+	onload(): void {
+		void this.loadSettings().then(() => {
+			// Settings tab
+			this.addSettingTab(new WorkBuddySettingTab(this.app, this));
 
-		// Settings tab
-		this.addSettingTab(new WorkBuddySettingTab(this.app, this));
+			// Status bar — clickable link to open/focus dashboard
+			this.statusBarEl = this.addStatusBarItem();
+			this.statusBarEl.setText("Starting...");
+			this.statusBarEl.addClass("mod-clickable");
+			this.registerDomEvent(this.statusBarEl, "click", () => {
+				fetch(`http://127.0.0.1:${this.settings.port}/notifications/open-dashboard`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ view_id: "dashboard" }),
+				}).catch(() => { /* fire-and-forget */ });
+			});
 
-		// Status bar — clickable "WB Dash" link to open/focus dashboard
-		this.statusBarEl = this.addStatusBarItem();
-		this.statusBarEl.setText("WB: starting...");
-		this.statusBarEl.addClass("mod-clickable");
-		this.registerDomEvent(this.statusBarEl, "click", () => {
-			fetch(`http://127.0.0.1:${this.settings.port}/notifications/open-dashboard`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ view_id: "dashboard" }),
-			}).catch(() => {});
-		});
-
-		// Defer server start until layout is ready (Obsidian perf guidance)
-		this.app.workspace.onLayoutReady(() => {
-			this.startBridge();
+			// Defer server start until layout is ready (Obsidian perf guidance)
+			this.app.workspace.onLayoutReady(() => {
+				void this.startBridge();
+			});
 		});
 	}
 
-	async onunload() {
-		await this.stopBridge();
+	onunload(): void {
+		void this.stopBridge();
 	}
 
 	async loadSettings() {
@@ -92,18 +92,18 @@ export default class WorkBuddyPlugin extends Plugin {
 			await this.bridge.start(this.settings.port, this.settings.host);
 
 			if (this.statusBarEl) {
-				this.statusBarEl.setText("WB Dash");
+				this.statusBarEl.setText("Dashboard");
 			}
-			console.log(
+			console.debug(
 				`[work-buddy] Bridge server listening on ${this.settings.host}:${this.settings.port}`
 			);
 		} catch (err) {
 			const msg =
 				err instanceof Error ? err.message : String(err);
 			console.error(`[work-buddy] Failed to start bridge: ${msg}`);
-			new Notice(`Work Buddy: Failed to start bridge server — ${msg}`);
+			new Notice(`Work Buddy: failed to start bridge server — ${msg}`);
 			if (this.statusBarEl) {
-				this.statusBarEl.setText("WB Dash \u26a0");
+				this.statusBarEl.setText("Dashboard \u26a0");
 			}
 		}
 	}
@@ -112,7 +112,7 @@ export default class WorkBuddyPlugin extends Plugin {
 		if (this.bridge) {
 			await this.bridge.stop();
 			this.bridge = null;
-			console.log("[work-buddy] Bridge server stopped.");
+			console.debug("[work-buddy] Bridge server stopped.");
 		}
 	}
 }
