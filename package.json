@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-work-buddy",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Companion Obsidian plugin for the work-buddy agent framework. Exposes an HTTP bridge for vault access, notifications, and JavaScript execution.",
 	"main": "main.js",
 	"type": "module",
