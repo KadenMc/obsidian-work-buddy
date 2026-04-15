@@ -63,7 +63,7 @@ export async function healthHandler(...[app, , , , query]: HArgs): Promise<Handl
 		status: 200,
 		body: {
 			status: "ok",
-			plugin: "obsidian-work-buddy",
+			plugin: "work-buddy",
 			version: PLUGIN_VERSION,
 			vault: app.vault.getName(),
 			compatibility,
