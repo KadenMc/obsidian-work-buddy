@@ -18,6 +18,8 @@ import {
 	notificationAcknowledgeHandler,
 	notificationOpenDashboardHandler,
 } from "./handlers";
+import { registerInlineMenu } from "./inlineMenu";
+import { registerTagWatcher } from "./tagWatcher";
 
 export default class WorkBuddyPlugin extends Plugin {
 	settings: WorkBuddySettings;
@@ -44,6 +46,8 @@ export default class WorkBuddyPlugin extends Plugin {
 			// Defer server start until layout is ready (Obsidian perf guidance)
 			this.app.workspace.onLayoutReady(() => {
 				void this.startBridge();
+				registerInlineMenu(this);
+				registerTagWatcher(this);
 			});
 		});
 	}

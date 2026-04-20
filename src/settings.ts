@@ -6,6 +6,7 @@ export interface WorkBuddySettings {
 	host: string;
 	evalEnabled: boolean;
 	evalTimeoutMs: number;
+	dashboardPort: number;
 }
 
 export const DEFAULT_SETTINGS: WorkBuddySettings = {
@@ -13,6 +14,7 @@ export const DEFAULT_SETTINGS: WorkBuddySettings = {
 	host: "127.0.0.1",
 	evalEnabled: true,
 	evalTimeoutMs: 10000,
+	dashboardPort: 5127,
 };
 
 export class WorkBuddySettingTab extends PluginSettingTab {
@@ -40,6 +42,25 @@ export class WorkBuddySettingTab extends PluginSettingTab {
 						const parsed = parseInt(value, 10);
 						if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
 							this.plugin.settings.port = parsed;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Dashboard port")
+			.setDesc(
+				"Port of the work-buddy dashboard service used for inline commands. " +
+				"Restart plugin after changing."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("5127")
+					.setValue(String(this.plugin.settings.dashboardPort))
+					.onChange(async (value) => {
+						const parsed = parseInt(value, 10);
+						if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
+							this.plugin.settings.dashboardPort = parsed;
 							await this.plugin.saveSettings();
 						}
 					})
