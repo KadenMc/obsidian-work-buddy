@@ -251,6 +251,28 @@ export async function filesWriteHandler(
 	const existing = app.vault.getAbstractFileByPath(filePath);
 
 	if (existing && existing instanceof TFile) {
+		// Pre-flight: refuse the write if any open editor on this file
+		// has unsaved typing. Writing now would clobber the user's
+		// in-flight edits when we sync the editor below; declining now
+		// is reversible (caller retries on backoff), clobbering isn't.
+		const diskContentBefore = await app.vault.read(existing);
+		const dirtyEditor = findDirtyEditorOnPath(
+			app, filePath, diskContentBefore
+		);
+		if (dirtyEditor) {
+			noticeEditorConflictDebounced(filePath);
+			return {
+				status: 409,
+				body: {
+					error: "editor_dirty",
+					reason:
+						"Open editor on this file has unsaved typing; " +
+						"refusing write to prevent clobbering user edits.",
+					path: filePath,
+				},
+			};
+		}
+
 		await app.vault.modify(existing, content);
 		// vault.modify() fires Obsidian's `modify` event and updates the
 		// TFile + metadataCache, but a MarkdownView in source / live-preview
@@ -261,9 +283,42 @@ export async function filesWriteHandler(
 		syncOpenEditorsToDisk(app, filePath, content);
 		return { status: 200, body: { path: filePath, created: false } };
 	} else {
+		// New file — no editor possibly open on it, no conflict possible.
 		await app.vault.create(filePath, content);
 		return { status: 201, body: { path: filePath, created: true } };
 	}
+}
+
+/**
+ * Find the first open MarkdownView on ``filePath`` whose editor value
+ * diverges from the on-disk content (i.e., user has typed since the last
+ * auto-save). Returns true if any such editor exists.
+ *
+ * The comparison is editor-text vs. caller-supplied disk-text rather than
+ * any "isDirty" flag because Obsidian's MarkdownView does not expose a
+ * stable dirty-state API. Comparing text is robust across modes and CM6
+ * internal state.
+ */
+function findDirtyEditorOnPath(
+	app: App,
+	filePath: string,
+	diskContent: string
+): boolean {
+	let dirty = false;
+	app.workspace.iterateAllLeaves((leaf) => {
+		if (dirty) return;
+		if (
+			leaf.view instanceof MarkdownView &&
+			leaf.view.file?.path === filePath
+		) {
+			const editor = leaf.view.editor;
+			if (!editor) return;
+			if (editor.getValue() !== diskContent) {
+				dirty = true;
+			}
+		}
+	});
+	return dirty;
 }
 
 /**
@@ -273,6 +328,11 @@ export async function filesWriteHandler(
  * Called from filesWriteHandler after vault.modify() to work around CM6's
  * in-memory document state outliving an external write. See the note at
  * the call site for the mode-dependent reason this is needed.
+ *
+ * SAFETY: by the time this runs we have already passed the dirty-editor
+ * pre-flight check, so any in-memory editor value should match the prior
+ * disk content (which we are about to overwrite). The equality short
+ * circuit handles the no-op case.
  */
 function syncOpenEditorsToDisk(
 	app: App,
@@ -301,6 +361,34 @@ function syncOpenEditorsToDisk(
 			}
 		}
 	});
+}
+
+/**
+ * Per-path debounce window (ms) for editor-conflict Notices. The Python
+ * bridge retries on a 5/10/20s schedule, so without debouncing the user
+ * would see four toasts for the same conflict. 30s covers the full
+ * retry schedule plus headroom.
+ */
+const EDITOR_CONFLICT_NOTICE_DEBOUNCE_MS = 30_000;
+const _lastEditorConflictNotice: Map<string, number> = new Map();
+
+/**
+ * Show the user an in-Obsidian Notice that work-buddy is waiting on their
+ * unsaved edits. Debounced per file path so a flurry of bridge retries
+ * doesn't spam the toast surface. User-facing notifications are
+ * intentionally Obsidian-only here: if the user is dirty-typing in a
+ * file, they are by definition active in Obsidian.
+ */
+function noticeEditorConflictDebounced(filePath: string): void {
+	const now = Date.now();
+	const last = _lastEditorConflictNotice.get(filePath) ?? 0;
+	if (now - last < EDITOR_CONFLICT_NOTICE_DEBOUNCE_MS) return;
+	_lastEditorConflictNotice.set(filePath, now);
+	new Notice(
+		`work-buddy is waiting to update "${filePath}" — finish your ` +
+			`edit and save (or pause typing for ~5s) so the write can land.`,
+		8000
+	);
 }
 
 /**
