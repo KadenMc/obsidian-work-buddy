@@ -251,12 +251,190 @@ export async function filesWriteHandler(
 	const existing = app.vault.getAbstractFileByPath(filePath);
 
 	if (existing && existing instanceof TFile) {
+		// Pre-flight: refuse the write if any open editor on this file
+		// has unsaved typing. Writing now would clobber the user's
+		// in-flight edits when we sync the editor below; declining now
+		// is reversible (caller retries on backoff), clobbering isn't.
+		const diskContentBefore = await app.vault.read(existing);
+		const dirtyEditor = findDirtyEditorOnPath(
+			app, filePath, diskContentBefore
+		);
+		if (dirtyEditor) {
+			noticeEditorConflictDebounced(filePath);
+			return {
+				status: 409,
+				body: {
+					error: "editor_dirty",
+					reason:
+						"Open editor on this file has unsaved typing; " +
+						"refusing write to prevent clobbering user edits.",
+					path: filePath,
+				},
+			};
+		}
+
 		await app.vault.modify(existing, content);
+		// vault.modify() fires Obsidian's `modify` event and updates the
+		// TFile + metadataCache, but a MarkdownView in source / live-preview
+		// mode keeps its own CodeMirror document state. Without the nudge
+		// below, any tab currently viewing this file shows stale content
+		// until the user closes + reopens it. Reading mode re-renders on
+		// the modify event so we only need to touch the editor doc.
+		//
+		// The TOCTOU between the pre-flight dirty check and setValue is
+		// closed inside syncOpenEditorsToDisk by re-checking the editor
+		// against ``diskContentBefore``: if the user typed during the
+		// vault.modify window, the editor will no longer match the
+		// pre-write disk and we must not clobber.
+		syncOpenEditorsToDisk(app, filePath, content, diskContentBefore);
 		return { status: 200, body: { path: filePath, created: false } };
 	} else {
+		// New file — no editor possibly open on it, no conflict possible.
 		await app.vault.create(filePath, content);
 		return { status: 201, body: { path: filePath, created: true } };
 	}
+}
+
+/**
+ * Find the first open MarkdownView on ``filePath`` whose editor value
+ * diverges from the on-disk content (i.e., user has typed since the last
+ * auto-save). Returns true if any such editor exists.
+ *
+ * The comparison is editor-text vs. caller-supplied disk-text rather than
+ * any "isDirty" flag because Obsidian's MarkdownView does not expose a
+ * stable dirty-state API. Comparing text is robust across modes and CM6
+ * internal state.
+ */
+function findDirtyEditorOnPath(
+	app: App,
+	filePath: string,
+	diskContent: string
+): boolean {
+	let dirty = false;
+	app.workspace.iterateAllLeaves((leaf) => {
+		if (dirty) return;
+		if (
+			leaf.view instanceof MarkdownView &&
+			leaf.view.file?.path === filePath
+		) {
+			const editor = leaf.view.editor;
+			if (!editor) return;
+			if (editor.getValue() !== diskContent) {
+				dirty = true;
+			}
+		}
+	});
+	return dirty;
+}
+
+/**
+ * Force any open MarkdownView on ``filePath`` to show ``content`` in its
+ * CodeMirror editor. Preserves cursor position where possible.
+ *
+ * Called from filesWriteHandler after vault.modify() to work around CM6's
+ * in-memory document state outliving an external write. See the note at
+ * the call site for the mode-dependent reason this is needed.
+ *
+ * Closes the TOCTOU race between the pre-flight dirty check and this call
+ * by comparing the editor's current value to the pre-write disk content
+ * (``expectedPreWriteDisk``). If they diverge, the user typed during the
+ * vault.modify window — calling setValue would silently destroy those
+ * keystrokes. We bail out instead, leaving the editor in the user's
+ * hands. The disk has the new content; the editor still shows the user's
+ * typing. The user's next save would clobber our external write — that's
+ * the lesser evil compared to destroying typing in real time. We fire a
+ * Notice so the user knows the situation.
+ */
+function syncOpenEditorsToDisk(
+	app: App,
+	filePath: string,
+	content: string,
+	expectedPreWriteDisk: string
+): void {
+	app.workspace.iterateAllLeaves((leaf) => {
+		if (
+			leaf.view instanceof MarkdownView &&
+			leaf.view.file?.path === filePath
+		) {
+			const editor = leaf.view.editor;
+			if (!editor) return;
+			const editorValue = editor.getValue();
+			// Already in sync (e.g., reading mode re-rendered on the
+			// modify event, or the editor happened to match by coincidence).
+			if (editorValue === content) return;
+			// User typed during the vault.modify window. Don't clobber.
+			if (editorValue !== expectedPreWriteDisk) {
+				noticeRaceLossDebounced(filePath);
+				return;
+			}
+			// Editor is exactly what we just overwrote on disk. Safe.
+			const cursor = editor.getCursor();
+			editor.setValue(content);
+			// Best-effort cursor restore. setCursor clamps to document
+			// bounds, so a shorter post-write document just lands the
+			// cursor at the end — acceptable.
+			try {
+				editor.setCursor(cursor);
+			} catch {
+				/* cursor restoration is best-effort only */
+			}
+		}
+	});
+}
+
+/**
+ * Per-path debounce windows (ms) for the two editor-conflict Notice kinds.
+ * The Python bridge retries on a 5/10/20s schedule, so without debouncing
+ * each refused write would emit up to four toasts. 60s covers the full
+ * retry schedule plus headroom and prevents the "second toast at t=35s
+ * just as everything fails" UX where the user sees the warning AFTER the
+ * write has already given up.
+ */
+const EDITOR_CONFLICT_NOTICE_DEBOUNCE_MS = 60_000;
+const _lastEditorConflictNotice: Map<string, number> = new Map();
+const _lastRaceLossNotice: Map<string, number> = new Map();
+
+/**
+ * Show the user an in-Obsidian Notice that work-buddy is waiting on their
+ * unsaved edits. Debounced per file path so a flurry of bridge retries
+ * doesn't spam the toast surface. User-facing notifications are
+ * intentionally Obsidian-only here: if the user is dirty-typing in a
+ * file, they are by definition active in Obsidian.
+ */
+function noticeEditorConflictDebounced(filePath: string): void {
+	const now = Date.now();
+	const last = _lastEditorConflictNotice.get(filePath) ?? 0;
+	if (now - last < EDITOR_CONFLICT_NOTICE_DEBOUNCE_MS) return;
+	_lastEditorConflictNotice.set(filePath, now);
+	new Notice(
+		`work-buddy is waiting to update "${filePath}" — finish your ` +
+			`edit and save (or pause typing for ~5s) so the write can land.`,
+		8000
+	);
+}
+
+/**
+ * Show the user a Notice that the external write landed but their typing
+ * was preserved (we did NOT setValue because the editor diverged from the
+ * pre-write disk during the vault.modify window). The user should reload
+ * the file to see the external change; saving from this stale editor
+ * would overwrite our write.
+ *
+ * Distinct debounce key from the pre-flight Notice — these are different
+ * failure modes and the user might see both for the same file across a
+ * minute (one rejected attempt, one accepted-but-clobber-risk attempt).
+ */
+function noticeRaceLossDebounced(filePath: string): void {
+	const now = Date.now();
+	const last = _lastRaceLossNotice.get(filePath) ?? 0;
+	if (now - last < EDITOR_CONFLICT_NOTICE_DEBOUNCE_MS) return;
+	_lastRaceLossNotice.set(filePath, now);
+	new Notice(
+		`External write landed on "${filePath}" but your unsaved typing ` +
+			`is preserved in the editor. Saving now will overwrite the ` +
+			`external change — close + reopen the file to see both.`,
+		10000
+	);
 }
 
 /**
