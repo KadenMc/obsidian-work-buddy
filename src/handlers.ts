@@ -252,11 +252,55 @@ export async function filesWriteHandler(
 
 	if (existing && existing instanceof TFile) {
 		await app.vault.modify(existing, content);
+		// vault.modify() fires Obsidian's `modify` event and updates the
+		// TFile + metadataCache, but a MarkdownView in source / live-preview
+		// mode keeps its own CodeMirror document state. Without the nudge
+		// below, any tab currently viewing this file shows stale content
+		// until the user closes + reopens it. Reading mode re-renders on
+		// the modify event so we only need to touch the editor doc.
+		syncOpenEditorsToDisk(app, filePath, content);
 		return { status: 200, body: { path: filePath, created: false } };
 	} else {
 		await app.vault.create(filePath, content);
 		return { status: 201, body: { path: filePath, created: true } };
 	}
+}
+
+/**
+ * Force any open MarkdownView on ``filePath`` to show ``content`` in its
+ * CodeMirror editor. Preserves cursor position where possible.
+ *
+ * Called from filesWriteHandler after vault.modify() to work around CM6's
+ * in-memory document state outliving an external write. See the note at
+ * the call site for the mode-dependent reason this is needed.
+ */
+function syncOpenEditorsToDisk(
+	app: App,
+	filePath: string,
+	content: string
+): void {
+	app.workspace.iterateAllLeaves((leaf) => {
+		if (
+			leaf.view instanceof MarkdownView &&
+			leaf.view.file?.path === filePath
+		) {
+			const editor = leaf.view.editor;
+			if (!editor) return;
+			// Skip if editor already matches — avoids a redundant CM6
+			// transaction (and the cursor-jump side effect) on every write.
+			if (editor.getValue() === content) return;
+			const cursor = editor.getCursor();
+			editor.setValue(content);
+			// Best-effort cursor restore. setCursor clamps to document
+			// bounds, so a shorter post-write document just lands the
+			// cursor at the end — acceptable.
+			try {
+				editor.setCursor(cursor);
+			} catch {
+				/* cursor restoration is best-effort only */
+			}
+		}
+	});
 }
 
 /**
