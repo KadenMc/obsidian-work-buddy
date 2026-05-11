@@ -7,7 +7,7 @@ import type { HandlerResult, RouteParams } from "./server";
 type HArgs = [App, WorkBuddySettings, unknown, RouteParams, URLSearchParams];
 
 /** Plugin version — keep in sync with manifest.json */
-const PLUGIN_VERSION = "0.1.1";
+const PLUGIN_VERSION = "0.1.2";
 
 /**
  * Compatible work-buddy version range for this plugin release.
@@ -698,7 +698,14 @@ class NotificationRequestModal extends Modal {
 
 	/**
 	 * POST a consent_grant message to the messaging service (localhost:5123).
-	 * The sidecar's MessagePoller dispatches it as a capability call.
+	 * The sidecar's MessagePoller dispatches it via the consent_grant
+	 * special case, which routes the grant to the ORIGINATING agent's
+	 * session DB by looking up the notification by id (Bug 1A,
+	 * task t-154af398). Including ``notification_id`` in the body is
+	 * required for the cross-session routing — without it the sidecar
+	 * logs a warning and falls back to writing the grant in its own
+	 * session DB (legacy behaviour, masks the real problem).
+	 *
 	 * Fire-and-forget — errors are logged but don't block the modal.
 	 */
 	private async dispatchConsentGrant(operation: string, mode: string) {
@@ -713,6 +720,7 @@ class NotificationRequestModal extends Modal {
 				operation,
 				mode,
 				ttl_minutes: ttlMinutes,
+				notification_id: this.notificationId,
 			}),
 			priority: "high",
 			tags: ["consent-callback", "from-obsidian"],
